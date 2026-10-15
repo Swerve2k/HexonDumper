@@ -1,0 +1,7 @@
+Hexon replaces game textures by hooking DirectX 12 inside the game's process.
+
+Use it only with offline or unprotected games. In games protected by anti-cheat (BattlEye, Easy Anti-Cheat and similar) it can get your account banned.
+
+Hexon adds a dxgi.dll file to the game folders you choose. If a game folder already has a different dxgi.dll, Hexon asks before replacing it, keeps a backup, and puts it back when you uninstall Hexon from that game.
+
+You use Hexon at your own risk.
