@@ -22,4 +22,4 @@ Hexon adds a `dxgi.dll` to the game folders you choose. If one is already there,
 
 Only use Hexon with offline or unprotected games. In games with anti-cheat it can get your account banned. Hexon warns you when it finds common anti-cheat files in a game folder.
 
-Hexon supports 64-bit DirectX 12 games.
+Hexon supports 64-bit DirectX 11 and 12 games, with partial DX10 support.
