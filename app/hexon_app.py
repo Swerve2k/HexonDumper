@@ -22,7 +22,7 @@ from hexon_profiles import (CURRENT, FOREIGN, INDEX_NAME, NO_EXE, NOT_INSTALLED,
                             bitness_problem, detect_anticheat, dll_state, guess_game_name, install as install_dll,
                             last_launch_summary, read_ini, uninstall as uninstall_dll, write_ini)
 
-VERSION = "2.0.0-dev.1"
+VERSION = "2.0.0-dev.2"
 DISCORD_APP_ID = "1558850044126568501"
 DISCORD_LARGE_IMAGE = "hexon"
 DISCORD_BUTTON = {"label": "Get Hexon", "url": "https://github.com/Swerve2k/HexonDumper"}

@@ -120,3 +120,22 @@ def test_read_dump_index(tmp_path):
     nohdr = tmp_path / "n.tsv"
     nohdr.write_text("00000000000000aa\t1\n")
     assert hp.read_dump_index(nohdr) == {}
+    assert "top_hash" not in idx["00000000000000aa"]
+
+
+def test_read_dump_index_with_top_hash(tmp_path):
+    f = tmp_path / hp.INDEX_NAME
+    f.write_text("\n".join([
+        INDEX_HEADER + "\ttop_hash",
+        "00000000000000aa\t64\t64\tBC7\t0\t3\t0\t64\t64\t0000000000000001\t00000000000000ff\t1\t00000000000000AA",
+        "00000000000000bb\t32\t32\tBC7\t1\t3\t0\t64\t64\t0000000000000001\t00000000000000ff\t2\t00000000000000aa",
+        "00000000000000cc\t32\t32\tBC7\t1\t3\t0\t64\t64\t0000000000000001\t00000000000000ff\t3\t0000000000000000",
+        "00000000000000dd\t32\t32\tBC7\t1\t3\t0\t64\t64\t0000000000000001\t00000000000000ff\t4\tnot-a-hash",
+        "00000000000000ee\t32\t32\tBC7\t1\t3\t0\t64\t64\t0000000000000001\t00000000000000ff\t5",
+    ]) + "\n")
+    idx = hp.read_dump_index(f)
+    assert sorted(idx) == ["00000000000000aa", "00000000000000bb", "00000000000000cc", "00000000000000dd"]
+    assert idx["00000000000000aa"]["top_hash"] == "00000000000000aa"
+    assert idx["00000000000000bb"]["top_hash"] == "00000000000000aa"
+    assert idx["00000000000000cc"]["top_hash"] == "0000000000000000"
+    assert idx["00000000000000dd"]["top_hash"] == ""

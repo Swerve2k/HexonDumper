@@ -1,5 +1,5 @@
 #define MyAppName "Hexon"
-#define MyAppVersion "2.0.0-dev.1"
+#define MyAppVersion "2.0.0-dev.2"
 #define MyAppPublisher "CELESTARR Productions"
 #define MyAppExeName "Hexon.exe"
 #define BuildDir AddBackslash(SourcePath) + "..\dist\Hexon"

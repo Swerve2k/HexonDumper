@@ -430,6 +430,9 @@ def read_dump_index(path) -> dict:
         except ValueError:
             continue
         rec["hash"] = h
+        if "top_hash" in rec:
+            t = rec["top_hash"].lower()
+            rec["top_hash"] = t if len(t) == 16 and all(c in "0123456789abcdef" for c in t) else ""
         out.setdefault(h, rec)
     return out
 

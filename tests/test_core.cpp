@@ -247,8 +247,23 @@ struct Gpu {
 };
 
 static void TestPureHelpers() {
-    const std::string line = IndexLine(0xabcull, 64, 32, "BC7", 1, 3, 0, 128, 64, 7, 0xffull, 1700000000000ull);
-    CHECK(line == "0000000000000abc\t64\t32\tBC7\t1\t3\t0\t128\t64\t0000000000000007\t00000000000000ff\t1700000000000\n");
+    const std::string line = IndexLine(0xabcull, 64, 32, "BC7", 1, 3, 0, 128, 64, 7, 0xffull, 1700000000000ull, 0x123ull);
+    CHECK(line == "0000000000000abc\t64\t32\tBC7\t1\t3\t0\t128\t64\t0000000000000007\t00000000000000ff\t1700000000000\t0000000000000123\n");
+    const std::string v1 = "hash\tw\th\tfamily\tmip\tmips\tslice\ttop_w\ttop_h\tgroup\tsession\ttime_ms\r\n"
+    "00000000000000a1\t8\t8\tBC1\t0\t1\t0\t8\t8\t0000000000000001\t0000000000000002\t5\r\n"
+    "broken\trow\n\n"
+    "00000000000000a2\t4\t4\tBC1\t1\t2\t0\t8\t8\t0000000000000001\t0000000000000002\t6\t00000000000000a1\n"
+    "00000000000000a3\t4\t4\tBC1\t1\t2\t0\t8\t8\t0000000000000001\t0000000000000002\t7";
+    std::vector<uint8_t> vb(v1.begin(), v1.end());
+    size_t kept = 0, dropped = 0;
+    const std::string up = UpgradeIndex(vb, kept, dropped);
+    CHECK(kept == 3 && dropped == 1);
+    CHECK(up == std::string(kIndexHeader) +
+                "00000000000000a1\t8\t8\tBC1\t0\t1\t0\t8\t8\t0000000000000001\t0000000000000002\t5\t0000000000000000\n"
+                "00000000000000a2\t4\t4\tBC1\t1\t2\t0\t8\t8\t0000000000000001\t0000000000000002\t6\t00000000000000a1\n"
+                "00000000000000a3\t4\t4\tBC1\t1\t2\t0\t8\t8\t0000000000000001\t0000000000000002\t7\t0000000000000000\n");
+    std::vector<uint8_t> current(kIndexHeader, kIndexHeader + strlen(kIndexHeader));
+    CHECK(UpgradeIndex(current, kept, dropped) == kIndexHeader && kept == 0 && dropped == 0);
     std::string text = std::string(kIndexHeader) + line + "zzzz\n0000000000000def\tx\n00000000000001\tshort\n";
     std::vector<uint8_t> buf(text.begin(), text.end());
     std::unordered_set<uint64_t> got;
@@ -308,8 +323,8 @@ static void TestEndToEnd() {
     std::string index = ReadText(g_dumpDir + L"\\index.tsv");
     CHECK(index.compare(0, strlen(kIndexHeader), kIndexHeader) == 0);
     auto fa = Fields(index, Hex(hashA));
-    CHECK(fa.size() == 12 && fa[1] == "64" && fa[2] == "64" && fa[3] == "RGBA8" && fa[4] == "0" && fa[5] == "1" &&
-          fa[7] == "64" && fa[8] == "64" && fa[10] == Hex(g_session));
+    CHECK(fa.size() == 13 && fa[1] == "64" && fa[2] == "64" && fa[3] == "RGBA8" && fa[4] == "0" && fa[5] == "1" &&
+          fa[7] == "64" && fa[8] == "64" && fa[10] == Hex(g_session) && fa[12] == Hex(hashA));
     gpu.Upload(texA, 0, a1);
     CHECK(CountLinesStarting(ReadText(g_dumpDir + L"\\index.tsv"), Hex(hashA)) == 1);
 
@@ -320,12 +335,14 @@ static void TestEndToEnd() {
     auto b0 = Fields(index, Hex(ExpectedHash(64, 64, bLevels[0])));
     auto b1 = Fields(index, Hex(ExpectedHash(32, 32, bLevels[1])));
     auto b2 = Fields(index, Hex(ExpectedHash(16, 16, bLevels[2])));
-    CHECK(b0.size() == 12 && b1.size() == 12 && b2.size() == 12);
-    if (b0.size() == 12 && b1.size() == 12 && b2.size() == 12) {
+    const std::string topB = Hex(ExpectedHash(64, 64, bLevels[0]));
+    CHECK(b0.size() == 13 && b1.size() == 13 && b2.size() == 13);
+    if (b0.size() == 13 && b1.size() == 13 && b2.size() == 13) {
         CHECK(b0[4] == "0" && b1[4] == "1" && b2[4] == "2");
         CHECK(b0[5] == "3" && b1[5] == "3" && b2[5] == "3");
         CHECK(b1[7] == "64" && b2[8] == "64");
         CHECK(b0[9] == b1[9] && b1[9] == b2[9] && b0[9] != fa[9]);
+        CHECK(b0[12] == topB && b1[12] == topB && b2[12] == topB);
     }
 
     const std::wstring repA = g_repDir + L"\\" + HexName(hashA, W, H, "RGBA8");
@@ -359,12 +376,55 @@ static void TestEndToEnd() {
     CHECK(WaitFor([&] { return CurrentTable()->byHash.count(hashB) == 0; }));
     g_minDim = 4;
 
+    ID3D12Resource* texC = gpu.Texture(64, 64, 2);
+    const std::vector<uint8_t> x0 = Pattern(64 * 64 * 4, 41), x1 = Pattern(32 * 32 * 4, 42);
+    const std::vector<uint8_t> y0 = Pattern(64 * 64 * 4, 43), y1 = Pattern(32 * 32 * 4, 44), z1 = Pattern(32 * 32 * 4, 45);
+    const uint64_t hashX0 = ExpectedHash(64, 64, x0), hashY0 = ExpectedHash(64, 64, y0);
+    gpu.Upload(texC, 0, x0);
+    gpu.Upload(texC, 1, x1);
+    gpu.Upload(texC, 0, y0);
+    gpu.Upload(texC, 1, y1);
+    index = ReadText(g_dumpDir + L"\\index.tsv");
+    auto rx1 = Fields(index, Hex(ExpectedHash(32, 32, x1)));
+    auto ry0 = Fields(index, Hex(hashY0));
+    auto ry1 = Fields(index, Hex(ExpectedHash(32, 32, y1)));
+    CHECK(rx1.size() == 13 && ry0.size() == 13 && ry1.size() == 13);
+    if (rx1.size() == 13 && ry0.size() == 13 && ry1.size() == 13) {
+        CHECK(rx1[12] == Hex(hashX0) && ry1[12] == Hex(hashY0) && ry0[12] == Hex(hashY0));
+        CHECK(rx1[9] == ry1[9]);
+    }
+
     fclose(g_index);
     g_index = nullptr;
     OpenIndex();
-    CHECK(g_indexed.count(hashA) && g_indexed.count(hashB) && g_indexed.size() == 4);
+    CHECK(g_indexed.count(hashA) && g_indexed.count(hashB) && g_indexed.count(hashY0) && g_indexed.size() == 8);
     gpu.Upload(texA, 0, a1);
     CHECK(CountLinesStarting(ReadText(g_dumpDir + L"\\index.tsv"), Hex(hashA)) == 1);
+    gpu.Upload(texC, 0, y0);
+    gpu.Upload(texC, 1, z1);
+    index = ReadText(g_dumpDir + L"\\index.tsv");
+    auto rz1 = Fields(index, Hex(ExpectedHash(32, 32, z1)));
+    CHECK(rz1.size() == 13 && rz1[12] == Hex(hashY0) && CountLinesStarting(index, Hex(hashY0)) == 1);
+
+    fclose(g_index);
+    g_index = nullptr;
+    const std::string v1 = "hash\tw\th\tfamily\tmip\tmips\tslice\ttop_w\ttop_h\tgroup\tsession\ttime_ms\r\n"
+    "00000000000000a1\t8\t8\tBC1\t0\t1\t0\t8\t8\t0000000000000001\t0000000000000002\t5\r\n"
+    "broken\trow\n\n"
+    "00000000000000a2\t4\t4\tBC1\t1\t2\t0\t8\t8\t0000000000000001\t0000000000000002\t6\t00000000000000a1\n"
+    "00000000000000a3\t4\t4\tBC1\t1\t2\t0\t8\t8\t0000000000000001\t0000000000000002\t7";
+    WriteFileBytes(g_dumpDir + L"\\index.tsv", std::vector<uint8_t>(v1.begin(), v1.end()));
+    OpenIndex();
+    CHECK(g_index != nullptr && g_indexed.size() == 3 && g_indexed.count(0xa1) && g_indexed.count(0xa3));
+    index = ReadText(g_dumpDir + L"\\index.tsv");
+    CHECK(index.compare(0, strlen(kIndexHeader), kIndexHeader) == 0);
+    CHECK(index.find("00000000000000a1\t8\t8\tBC1\t0\t1\t0\t8\t8\t0000000000000001\t0000000000000002\t5\t0000000000000000\n") != std::string::npos);
+    CHECK(index.find("broken") == std::string::npos);
+    CHECK(GetFileAttributesW((g_dumpDir + L"\\index.tsv.tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+    gpu.Upload(texA, 0, a1);
+    auto again = Fields(ReadText(g_dumpDir + L"\\index.tsv"), Hex(hashA));
+    CHECK(again.size() == 13 && again[12] == Hex(hashA));
+    texC->Release();
 
     texA->Release();
     texB->Release();
@@ -411,7 +471,12 @@ int main() {
     g_session = NewSessionId();
     OpenIndex();
     RescanReplacements(false, false);
+    const std::wstring early = g_repDir + L"\\00000000000000ee_8x8_RGBA8.dds";
+    WriteAtomic(early, DdsFile(8, 8, {Pattern(256, 9)}));
     StartWatcher();
+    CHECK(WaitFor([] { RepEntry* e = FindRep(*CurrentTable(), 0xee); return e && e->valid; }, 3000));
+    DeleteFileW(early.c_str());
+    CHECK(WaitFor([] { return CurrentTable()->byHash.empty(); }));
     CHECK(MH_Initialize() == MH_OK);
 
     TestPureHelpers();

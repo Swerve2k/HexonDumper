@@ -40,7 +40,7 @@ void hexon::Log(const char* fmt, ...) {
 
 namespace {
 
-const char kProxyMarker[] = "HEXON-PROXY-DLL:2.0.0-dev.1";
+const char kProxyMarker[] = "HEXON-PROXY-DLL:2.0.0-dev.2";
 const char* volatile g_keepMarker = kProxyMarker;
 
 bool g_dump = true, g_replace = true, g_verbose = false, g_mips = true;
@@ -265,7 +265,7 @@ uint64_t Preload(const RepTable& t) {
     return used;
 }
 
-void RescanReplacements(bool preload, bool log) {
+uint64_t RescanReplacements(bool preload, bool log) {
     ScanStats st;
     std::shared_ptr<RepTable> t = BuildTable(*CurrentTable(), st);
     PublishTable(t);
@@ -273,60 +273,86 @@ void RescanReplacements(bool preload, bool log) {
     if (log && (st.added || st.changed || st.removed))
         hexon::Log("replacements: %zu file(s) (%zu new, %zu changed, %zu removed), %llu MB preloaded", st.files, st.added,
                    st.changed, st.removed, (unsigned long long)(pre >> 20));
+    return pre;
 }
 
-std::atomic<bool> g_watchStop{false};
+HANDLE g_watchStop = nullptr;
 HANDLE g_watchThread = nullptr;
+
+HANDLE OpenWatchDir() {
+    return CreateFileW(g_repDir.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+}
 
 DWORD WINAPI ReplacementWatcher(LPVOID) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    {
-        const std::shared_ptr<const RepTable> t = CurrentTable();
-        const uint64_t pre = Preload(*t);
-        hexon::Log("replacements: %zu file(s), %llu MB preloaded, watching the folder for changes", t->byHash.size(),
-                   (unsigned long long)(pre >> 20));
-    }
-    HANDLE dir = CreateFileW(g_repDir.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    const DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
     alignas(DWORD) uint8_t buf[16384];
-    while (!g_watchStop) {
-        if (dir != INVALID_HANDLE_VALUE) {
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE dir = ov.hEvent ? OpenWatchDir() : INVALID_HANDLE_VALUE;
+    bool pending = false;
+    auto arm = [&]() {
+        pending = false;
+        if (dir == INVALID_HANDLE_VALUE) return;
+        ResetEvent(ov.hEvent);
+        if (ReadDirectoryChangesW(dir, buf, sizeof buf, FALSE, filter, nullptr, &ov, nullptr)) {
+            pending = true;
+            return;
+        }
+        hexon::Log("replacement watcher can't watch the folder (error %lu), checking every 3 seconds instead", GetLastError());
+        CloseHandle(dir);
+        dir = INVALID_HANDLE_VALUE;
+    };
+    arm();
+    const uint64_t pre = RescanReplacements(true, false);
+    hexon::Log("replacements: %zu file(s), %llu MB preloaded, %s", CurrentTable()->byHash.size(), (unsigned long long)(pre >> 20),
+               pending ? "watching the folder for changes" : "checking the folder every 3 seconds");
+    for (;;) {
+        if (pending) {
+            HANDLE waits[2] = {g_watchStop, ov.hEvent};
+            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) break;
+            pending = false;
             DWORD got = 0;
-            if (!ReadDirectoryChangesW(dir, buf, sizeof buf, FALSE,
-                                       FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
-                                       &got, nullptr, nullptr)) {
-                const DWORD err = GetLastError();
+            if (!GetOverlappedResult(dir, &ov, &got, FALSE) && GetLastError() != ERROR_NOTIFY_ENUM_DIR) {
+                hexon::Log("replacement watcher lost the folder (error %lu), checking every 3 seconds instead", GetLastError());
                 CloseHandle(dir);
                 dir = INVALID_HANDLE_VALUE;
-                if (g_watchStop) break;
-                hexon::Log("replacement watcher can't watch the folder (error %lu), checking every 3 seconds instead", err);
-                continue;
             }
+            if (WaitForSingleObject(g_watchStop, 200) == WAIT_OBJECT_0) break;
+            arm();
         } else {
-            Sleep(3000);
+            if (WaitForSingleObject(g_watchStop, 3000) == WAIT_OBJECT_0) break;
+            if (dir == INVALID_HANDLE_VALUE && ov.hEvent) {
+                dir = OpenWatchDir();
+                arm();
+            }
         }
-        if (g_watchStop) break;
-        Sleep(200);
         RescanReplacements(true, true);
     }
+    if (pending) {
+        DWORD got = 0;
+        CancelIoEx(dir, &ov);
+        GetOverlappedResult(dir, &ov, &got, TRUE);
+    }
     if (dir != INVALID_HANDLE_VALUE) CloseHandle(dir);
+    if (ov.hEvent) CloseHandle(ov.hEvent);
     return 0;
 }
 
 void StartWatcher() {
-    g_watchStop = false;
+    if (!g_watchStop) g_watchStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ResetEvent(g_watchStop);
     g_watchThread = CreateThread(nullptr, 0, ReplacementWatcher, nullptr, 0, nullptr);
 }
 
 void StopWatcher() {
     if (!g_watchThread) return;
-    g_watchStop = true;
-    CancelSynchronousIo(g_watchThread);
+    SetEvent(g_watchStop);
     WaitForSingleObject(g_watchThread, 5000);
     CloseHandle(g_watchThread);
     g_watchThread = nullptr;
 }
-
 
 struct Pending {
     ID3D12Resource* src;
@@ -339,7 +365,9 @@ struct Pending {
 };
 
 const GUID kGroupGuid = {0x5d1e7a40, 0x2c3b, 0x4e91, {0xa6, 0x0f, 0x7b, 0x18, 0x93, 0xd2, 0x4c, 0x5e}};
-const char kIndexHeader[] = "hash\tw\th\tfamily\tmip\tmips\tslice\ttop_w\ttop_h\tgroup\tsession\ttime_ms\n";
+const GUID kTopGuid = {0x8b2f4d61, 0x7e05, 0x4c3a, {0x91, 0xd4, 0x2a, 0x6c, 0x0e, 0x5f, 0xb7, 0x13}};
+const char kIndexHeader[] = "hash\tw\th\tfamily\tmip\tmips\tslice\ttop_w\ttop_h\tgroup\tsession\ttime_ms\ttop_hash\n";
+const size_t kIndexFields = 13;
 std::atomic<uint64_t> g_nextGroup{1};
 uint64_t g_session = 1;
 FILE* g_index = nullptr;
@@ -361,6 +389,14 @@ uint64_t NewSessionId() {
     return id ? id : 1;
 }
 
+uint64_t TopHash(ID3D12Resource* r) {
+    uint64_t h = 0;
+    UINT sz = sizeof h;
+    return SUCCEEDED(r->GetPrivateData(kTopGuid, &sz, &h)) && sz == sizeof h ? h : 0;
+}
+
+void SetTopHash(ID3D12Resource* r, uint64_t h) { r->SetPrivateData(kTopGuid, sizeof h, &h); }
+
 uint64_t GroupId(ID3D12Resource* r) {
     uint64_t id = 0;
     UINT sz = sizeof id;
@@ -371,12 +407,41 @@ uint64_t GroupId(ID3D12Resource* r) {
 }
 
 std::string IndexLine(uint64_t hash, UINT w, UINT h, const char* fam, UINT mip, UINT mips, UINT slice, uint64_t topW, UINT topH,
-                      uint64_t group, uint64_t session, uint64_t ms) {
+                      uint64_t group, uint64_t session, uint64_t ms, uint64_t top) {
     char buf[256];
-    snprintf(buf, sizeof buf, "%016llx\t%u\t%u\t%s\t%u\t%u\t%u\t%llu\t%u\t%016llx\t%016llx\t%llu\n", (unsigned long long)hash, w, h,
-             fam, mip, mips, slice, (unsigned long long)topW, topH, (unsigned long long)group, (unsigned long long)session,
-             (unsigned long long)ms);
+    snprintf(buf, sizeof buf, "%016llx\t%u\t%u\t%s\t%u\t%u\t%u\t%llu\t%u\t%016llx\t%016llx\t%llu\t%016llx\n", (unsigned long long)hash,
+             w, h, fam, mip, mips, slice, (unsigned long long)topW, topH, (unsigned long long)group, (unsigned long long)session,
+             (unsigned long long)ms, (unsigned long long)top);
     return buf;
+}
+
+std::string UpgradeIndex(const std::vector<uint8_t>& buf, size_t& kept, size_t& dropped) {
+    std::string out = kIndexHeader;
+    kept = dropped = 0;
+    size_t pos = 0;
+    bool header = true;
+    while (pos < buf.size()) {
+        size_t end = pos;
+        while (end < buf.size() && buf[end] != '\n') ++end;
+        std::string line((const char*)buf.data() + pos, end - pos);
+        pos = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (header) {
+            header = false;
+            continue;
+        }
+        if (line.empty()) continue;
+        const size_t fields = (size_t)std::count(line.begin(), line.end(), '\t') + 1;
+        if (fields == kIndexFields - 1) line += "\t0000000000000000";
+        else if (fields != kIndexFields) {
+            ++dropped;
+            continue;
+        }
+        out += line;
+        out += '\n';
+        ++kept;
+    }
+    return out;
 }
 
 size_t LoadIndexedHashes(const std::vector<uint8_t>& buf, std::unordered_set<uint64_t>& out) {
@@ -405,6 +470,22 @@ void OpenIndex() {
     const bool existed = ReadWholeFile(path, buf);
     g_indexed.clear();
     g_indexChecked.clear();
+    const size_t headerLen = strlen(kIndexHeader);
+    if (existed && !buf.empty() && (buf.size() < headerLen || memcmp(buf.data(), kIndexHeader, headerLen) != 0)) {
+        size_t kept = 0, dropped = 0;
+        const std::string upgraded = UpgradeIndex(buf, kept, dropped);
+        const std::wstring tmp = path + L".tmp";
+        FILE* f = _wfopen(tmp.c_str(), L"wb");
+        const bool wrote = f && fwrite(upgraded.data(), 1, upgraded.size(), f) == upgraded.size();
+        if (f) fclose(f);
+        if (!wrote || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            DeleteFileW(tmp.c_str());
+            hexon::Log("could not upgrade the dump index, mip grouping will be missing for this session");
+            return;
+        }
+        hexon::Log("dump index upgraded to the new format (%zu row(s) kept, %zu unreadable row(s) dropped)", kept, dropped);
+        buf.assign(upgraded.begin(), upgraded.end());
+    }
     if (existed) LoadIndexedHashes(buf, g_indexed);
     g_index = _wfsopen(path.c_str(), L"ab", _SH_DENYNO);
     if (!g_index) {
@@ -417,13 +498,14 @@ void OpenIndex() {
     fflush(g_index);
 }
 
-void IndexTexture(uint64_t hash, const Pending& p, const char* fam, bool dumpedNow, const std::wstring& dumpPath) {
+void IndexTexture(uint64_t hash, const Pending& p, const D3D12_RESOURCE_DESC& d, const char* fam, bool dumpedNow,
+                  const std::wstring& dumpPath) {
     if (!g_index || g_indexed.count(hash) || !g_indexChecked.insert(hash).second) return;
     if (!dumpedNow && GetFileAttributesW(dumpPath.c_str()) == INVALID_FILE_ATTRIBUTES) return;
-    const D3D12_RESOURCE_DESC d = p.dst->GetDesc();
     const UINT mips = d.MipLevels ? d.MipLevels : 1;
-    const std::string line = IndexLine(hash, p.w, p.h, fam, p.subresource % mips, mips, p.subresource / mips, d.Width, d.Height,
-                                       GroupId(p.dst), g_session, UnixMillis());
+    const UINT mip = p.subresource % mips;
+    const std::string line = IndexLine(hash, p.w, p.h, fam, mip, mips, p.subresource / mips, d.Width, d.Height, GroupId(p.dst),
+                                       g_session, UnixMillis(), mip == 0 ? hash : TopHash(p.dst));
     fputs(line.c_str(), g_index);
     g_indexed.insert(hash);
     g_indexDirty = true;
@@ -616,6 +698,8 @@ void ProcessOne(const RepTable& t, const Pending& p, size_t idx, std::vector<siz
     const uint64_t seed = 0xcbf29ce484222325ULL ^ ((uint64_t)p.w | ((uint64_t)p.h << 16) | ((uint64_t)g.fi.bytes << 32) | ((uint64_t)g.fi.block << 40));
     const uint64_t hash = Hash64(tight.data(), tight.size(), seed);
     ++g_nProcessed;
+    const D3D12_RESOURCE_DESC desc = p.dst->GetDesc();
+    if (p.subresource % (desc.MipLevels ? desc.MipLevels : 1) == 0) SetTopHash(p.dst, hash);
 
     bool wrote = false;
     if (g_replace) {
@@ -654,7 +738,7 @@ void ProcessOne(const RepTable& t, const Pending& p, size_t idx, std::vector<siz
                 ++g_nDumped; g_dumpBytes += tight.size();
                 dumpedNow = true;
             }
-            if (wantIndex) IndexTexture(hash, p, g.fi.name, dumpedNow, path);
+            if (wantIndex) IndexTexture(hash, p, desc, g.fi.name, dumpedNow, path);
         }
     }
 
