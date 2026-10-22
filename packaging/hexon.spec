@@ -2,7 +2,9 @@ from pathlib import Path
 
 root = Path(SPECPATH).parent
 app = root / "app"
-core = next(p for p in (root / "build" / "Release" / "dxgi.dll", root / "prebuilt" / "dxgi.dll") if p.exists())
+core = next((p for p in (root / "build" / "Release" / "dxgi.dll", root / "prebuilt" / "dxgi.dll") if p.exists()), None)
+if core is None:
+    raise SystemExit("dxgi.dll was not found. Put the provided dxgi.dll in the prebuilt folder, or build it with CMake first.")
 
 main_a = Analysis(
     [str(app / "hexon.py")],

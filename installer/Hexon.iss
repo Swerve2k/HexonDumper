@@ -1,7 +1,12 @@
 #define MyAppName "Hexon"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "2.0.0-dev.1"
 #define MyAppPublisher "CELESTARR Productions"
 #define MyAppExeName "Hexon.exe"
+#define BuildDir AddBackslash(SourcePath) + "..\dist\Hexon"
+
+#if !FileExists(AddBackslash(BuildDir) + MyAppExeName)
+  #error Hexon.exe was not found in dist\Hexon. Build the app first by running packaging\build_release.bat, then compile this script again.
+#endif
 
 [Setup]
 AppId={{AC2BBF41-EA75-4B33-A6ED-913433F8AC4D}
@@ -35,7 +40,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\dist\Hexon\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -51,15 +56,15 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
-    if MsgBox('Remove Hexon from the games you set it up for?' + #13#10 + #13#10 +
+    if SuppressibleMsgBox('Remove Hexon from the games you set it up for?' + #13#10 + #13#10 +
               'This deletes the dxgi.dll Hexon added to each game folder and restores any original it replaced. ' +
               'Close your games first. Your dumped and replaced textures are not touched.',
-              mbConfirmation, MB_YESNO) = IDYES then
+              mbConfirmation, MB_YESNO, IDYES) = IDYES then
       Exec(ExpandConstant('{app}\{#MyAppExeName}'), '--remove-all', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
   if CurUninstallStep = usPostUninstall then
   begin
-    if MsgBox('Also delete your Hexon profiles and settings?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    if SuppressibleMsgBox('Also delete your Hexon profiles and settings?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
       DelTree(ExpandConstant('{userappdata}\CELESTARR\Hexon'), True, True, True);
   end;
 end;

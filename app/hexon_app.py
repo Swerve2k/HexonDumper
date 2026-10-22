@@ -18,12 +18,14 @@ from PySide6.QtWidgets import (
 )
 
 from hexon_discord import DiscordPresence, GameWatcher
-from hexon_profiles import (CURRENT, FOREIGN, NO_EXE, NOT_INSTALLED, OUTDATED, ProfileStore, bitness_problem, detect_anticheat,
-                            dll_state, guess_game_name, install as install_dll, last_launch_summary, read_ini,
-                            uninstall as uninstall_dll, write_ini)
+from hexon_profiles import (CURRENT, FOREIGN, INDEX_NAME, NO_EXE, NOT_INSTALLED, OUTDATED, ProfileStore, atomic_copy,
+                            bitness_problem, detect_anticheat, dll_state, guess_game_name, install as install_dll,
+                            last_launch_summary, read_ini, uninstall as uninstall_dll, write_ini)
 
-VERSION = "1.0.0"
+VERSION = "2.0.0-dev.1"
 DISCORD_APP_ID = "1558850044126568501"
+DISCORD_LARGE_IMAGE = "hexon"
+DISCORD_BUTTON = {"label": "Get Hexon", "url": "https://github.com/Swerve2k/HexonDumper"}
 FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = Path(__file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
@@ -72,6 +74,7 @@ FAMILY_TEXCONV = {
     "BC5": "BC5_UNORM", "BC6H": "BC6H_UF16", "BC7": "BC7_UNORM",
 }
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff"}
+TAB_PROFILES, TAB_TEXTURES, TAB_CHANGED, TAB_SETTINGS, TAB_LOG = range(5)
 TAB_ACTIVITY = ["Setting up the game", "Browsing textures", "Reviewing replaced textures",
                 "Tweaking settings", "Reading the log"]
 
@@ -759,17 +762,6 @@ class Hexon(QMainWindow):
         for c in (self.chk_rpc_game, self.chk_rpc_tab, self.chk_rpc_dumped, self.chk_rpc_replaced,
                   self.chk_rpc_usage, self.chk_rpc_running, self.chk_rpc_elapsed):
             f.addRow(c)
-        self.rpc_custom = line("Replaces the top line, e.g. Making a pink Black Ice pack")
-        f.addRow("Custom top line", self.rpc_custom)
-        self.rpc_large = line("hexon")
-        f.addRow("Large image key", self.rpc_large)
-        self.rpc_small = line("Optional")
-        f.addRow("Small image key", self.rpc_small)
-        self.rpc_btn_label = line("Optional, e.g. Get Hexon")
-        f.addRow("Button label", self.rpc_btn_label)
-        self.rpc_btn_url = line("https://...")
-        f.addRow("Button link", self.rpc_btn_url)
-        note("Image keys must match art assets uploaded to the Hexon Discord application.")
 
         section("Interface")
         self.chk_log = check("Show Log tab", False)
@@ -791,9 +783,6 @@ class Hexon(QMainWindow):
             "rpc_dumped": (self.chk_rpc_dumped, True), "rpc_replaced": (self.chk_rpc_replaced, True),
             "rpc_usage": (self.chk_rpc_usage, True), "rpc_running": (self.chk_rpc_running, True),
             "rpc_elapsed": (self.chk_rpc_elapsed, True),
-            "rpc_custom": (self.rpc_custom, ""), "rpc_large": (self.rpc_large, "hexon"),
-            "rpc_small": (self.rpc_small, ""), "rpc_btn_label": (self.rpc_btn_label, ""),
-            "rpc_btn_url": (self.rpc_btn_url, ""),
         }
         for w, _ in self._persist.values():
             (w.toggled if isinstance(w, QCheckBox) else w.editingFinished).connect(self._settings_changed)
@@ -1046,7 +1035,7 @@ class Hexon(QMainWindow):
             QMessageBox.warning(self, "Hexon", str(e))
             return
         self._on_profile_changed()
-        self.tabs.setCurrentIndex(0)
+        self.tabs.setCurrentIndex(TAB_PROFILES)
         if dll_state(p, self.core_dll) in (NOT_INSTALLED, FOREIGN) and self.core_dll:
             if QMessageBox.question(self, "Hexon", f"Install Hexon into {p.name} now?") == QMessageBox.Yes:
                 self._install()
@@ -1158,7 +1147,7 @@ class Hexon(QMainWindow):
             return
         if QMessageBox.question(self, "Hexon", "Delete every dumped texture? Your replacements are kept.") != QMessageBox.Yes:
             return
-        for f in (d / "dump").glob("*.dds"):
+        for f in [*(d / "dump").glob("*.dds"), d / "dump" / INDEX_NAME]:
             try:
                 f.unlink()
             except OSError:
@@ -1173,11 +1162,11 @@ class Hexon(QMainWindow):
 
     def _on_tab(self, i):
         w = self.tabs.widget(i)
-        if w is self.tabs.widget(1) and self._tex_dirty:
+        if w is self.tabs.widget(TAB_TEXTURES) and self._tex_dirty:
             self._refresh_tex()
-        elif w is self.tabs.widget(2):
+        elif w is self.tabs.widget(TAB_CHANGED):
             self._refresh_changed()
-        elif w is self.tabs.widget(3):
+        elif w is self.tabs.widget(TAB_SETTINGS):
             self._update_usage()
             self._refresh_texconv_status()
         self._push_presence()
@@ -1304,9 +1293,8 @@ class Hexon(QMainWindow):
                     "Use an image instead and Hexon can resize and convert it (needs texconv).")
         dest = d / "replace" / name
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
             if not (dest.exists() and src.resolve() == dest.resolve()):
-                shutil.copy2(src, dest)
+                atomic_copy(src, dest)
         except OSError as e:
             return f"Couldn't copy {src.name}: {e}"
         return None
@@ -1328,7 +1316,7 @@ class Hexon(QMainWindow):
 
     def _after_replace(self):
         self._fill_table()
-        if self.tabs.currentIndex() == 2:
+        if self.tabs.currentIndex() == TAB_CHANGED:
             self._refresh_changed()
         self._push_presence()
 
@@ -1440,7 +1428,7 @@ class Hexon(QMainWindow):
             return
         name = self._selected_name()
         if not name:
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(TAB_TEXTURES)
             QMessageBox.information(self, "Hexon", "Select a texture in the list first, then drop the file.")
             return
         self._replace_with_file(name, files[0])
@@ -1540,10 +1528,7 @@ class Hexon(QMainWindow):
             return text[:n]
 
         game = self._game_name()
-        custom = self.rpc_custom.text().strip()
-        if custom:
-            details = custom
-        elif self.chk_rpc_game.isChecked() and game:
+        if self.chk_rpc_game.isChecked() and game:
             details = f"Modding {game}"
         else:
             details = "Using Hexon"
@@ -1562,20 +1547,14 @@ class Hexon(QMainWindow):
             parts.append("Game running")
 
         payload = {"details": clip(details) if len(details) >= 2 else "Using Hexon",
-                   "large_image": self.rpc_large.text().strip() or "hexon",
+                   "large_image": DISCORD_LARGE_IMAGE,
                    "large_text": f"Hexon {VERSION}"}
         state = clip(" · ".join(parts))
         if len(state) >= 2:
             payload["state"] = state
         if self.chk_rpc_elapsed.isChecked():
             payload["start"] = self._started
-        small = self.rpc_small.text().strip()
-        if small:
-            payload["small_image"] = small
-            payload["small_text"] = "Game running" if running else "Hexon"
-        label, url = self.rpc_btn_label.text().strip(), self.rpc_btn_url.text().strip()
-        if label and url.lower().startswith(("http://", "https://")):
-            payload["buttons"] = [{"label": label[:32], "url": url}]
+        payload["buttons"] = [dict(DISCORD_BUTTON)]
         return payload
 
     def _push_presence(self):
@@ -1601,11 +1580,11 @@ class Hexon(QMainWindow):
             self._rep_count = scan_dds(d / "replace")[0]
             if count != self._dump_count:
                 self._dump_count = count
-                if self.tabs.currentIndex() == 1:
+                if self.tabs.currentIndex() == TAB_TEXTURES:
                     self._refresh_tex()
                 else:
                     self._tex_dirty = True
-            if self.tabs.currentIndex() == 3:
+            if self.tabs.currentIndex() == TAB_SETTINGS:
                 self._update_usage()
         self._push_presence()
 

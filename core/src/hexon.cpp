@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -39,7 +40,7 @@ void hexon::Log(const char* fmt, ...) {
 
 namespace {
 
-const char kProxyMarker[] = "HEXON-PROXY-DLL:1.0.0";
+const char kProxyMarker[] = "HEXON-PROXY-DLL:2.0.0-dev.1";
 const char* volatile g_keepMarker = kProxyMarker;
 
 bool g_dump = true, g_replace = true, g_verbose = false, g_mips = true;
@@ -111,29 +112,44 @@ uint64_t Hash64(const uint8_t* p, size_t n, uint64_t h) {
 struct RepEntry {
     std::wstring path;
     FILETIME mt{};
+    uint64_t size = 0;
+    std::mutex mu;
     bool loaded = false, valid = false;
     uint32_t fmtCode = 0;
     UINT w = 0, h = 0;
     std::vector<uint8_t> data;
     std::vector<hexon_dds::MipInfo> mips;
 };
+using RepPtr = std::shared_ptr<RepEntry>;
 
-std::unordered_map<uint64_t, RepEntry> g_rep;
-std::atomic<ULONGLONG> g_lastScan{0};
-bool g_anyMipRep = false;
+struct RepTable {
+    std::unordered_map<uint64_t, RepPtr> byHash;
+    std::unordered_set<uint64_t> sigs;
+};
 
-std::mutex g_sigMu;
-std::unordered_set<uint64_t> g_sigs;
+std::mutex g_tableMu;
+std::shared_ptr<const RepTable> g_table = std::make_shared<RepTable>();
+std::atomic<bool> g_anyMipRep{false};
+const uint64_t kPreloadBudget = 512ull << 20;
+
+std::shared_ptr<const RepTable> CurrentTable() {
+    std::lock_guard<std::mutex> lk(g_tableMu);
+    return g_table;
+}
+
+void PublishTable(std::shared_ptr<const RepTable> t) {
+    std::lock_guard<std::mutex> lk(g_tableMu);
+    g_table = std::move(t);
+}
 
 uint64_t SigKey(UINT w, UINT h, const char* fam) {
     return Hash64((const uint8_t*)fam, strlen(fam), 0x9E37ull ^ ((uint64_t)w << 20) ^ ((uint64_t)h << 40));
 }
-bool SigKnown(UINT w, UINT h, const char* fam) {
-    std::lock_guard<std::mutex> lk(g_sigMu);
-    return g_sigs.count(SigKey(w, h, fam)) != 0;
+bool SigKnown(const RepTable& t, UINT w, UINT h, const char* fam) {
+    return t.sigs.count(SigKey(w, h, fam)) != 0;
 }
 
-bool ParseRepName(const wchar_t* n, uint64_t& hash, UINT& w, UINT& h, char* fam  ) {
+bool ParseRepName(const wchar_t* n, uint64_t& hash, UINT& w, UINT& h, char* fam) {
     if (wcslen(n) < 24) return false;
     wchar_t* end = nullptr;
     hash = wcstoull(n, &end, 16);
@@ -151,56 +167,166 @@ bool ParseRepName(const wchar_t* n, uint64_t& hash, UINT& w, UINT& h, char* fam 
     return i > 0;
 }
 
-void LoadRep(RepEntry& e) {
-    e.loaded = true; e.valid = false;
-    FILE* f = _wfopen(e.path.c_str(), L"rb");
-    if (!f) return;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> buf(n > 0 ? (size_t)n : 0);
-    if (n > 0 && fread(buf.data(), 1, buf.size(), f) != buf.size()) { fclose(f); return; }
-    fclose(f);
+bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& out) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    bool ok = GetFileSizeEx(f, &sz) && sz.QuadPart >= 0 && sz.QuadPart < (1ll << 31);
+    if (ok) {
+        out.resize((size_t)sz.QuadPart);
+        size_t got = 0;
+        while (ok && got < out.size()) {
+            DWORD n = 0;
+            const DWORD want = (DWORD)std::min<size_t>(out.size() - got, 1u << 24);
+            ok = ReadFile(f, out.data() + got, want, &n, nullptr) && n > 0;
+            got += n;
+        }
+    }
+    CloseHandle(f);
+    return ok;
+}
 
+void LoadRepLocked(RepEntry& e) {
+    e.loaded = true;
+    e.valid = false;
+    std::vector<uint8_t> buf;
+    if (!ReadWholeFile(e.path, buf) || buf.empty()) return;
     hexon_dds::DdsInfo info;
     if (!hexon_dds::ParseDds(buf.data(), buf.size(), info)) return;
-    e.fmtCode = info.fmtCode; e.w = info.w; e.h = info.h;
+    e.fmtCode = info.fmtCode;
+    e.w = info.w;
+    e.h = info.h;
     e.mips = info.mips;
     e.data.assign(buf.begin() + info.dataOffset, buf.end());
     e.valid = true;
     if (e.mips.size() > 1) g_anyMipRep = true;
 }
 
-void ScanReplacements() {
-    std::unordered_set<uint64_t> present;
-    std::unordered_set<uint64_t> sigs;
+RepEntry* EnsureLoaded(const RepPtr& p) {
+    std::lock_guard<std::mutex> lk(p->mu);
+    if (!p->loaded) LoadRepLocked(*p);
+    return p.get();
+}
+
+RepEntry* FindRep(const RepTable& t, uint64_t hash) {
+    auto it = t.byHash.find(hash);
+    return it == t.byHash.end() ? nullptr : EnsureLoaded(it->second);
+}
+
+struct ScanStats { size_t files = 0, added = 0, changed = 0, removed = 0; };
+
+std::shared_ptr<RepTable> BuildTable(const RepTable& old, ScanStats& st) {
+    auto t = std::make_shared<RepTable>();
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((g_repDir + L"\\*.dds").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            const size_t len = wcslen(fd.cFileName);
+            if (len < 4 || _wcsicmp(fd.cFileName + len - 4, L".dds") != 0) continue;
             uint64_t key; UINT w, hgt; char fam[16];
-            if (!ParseRepName(fd.cFileName, key, w, hgt, fam)) continue;
-            present.insert(key);
-            sigs.insert(SigKey(w, hgt, fam));
-            RepEntry& e = g_rep[key];
-            if (e.path.empty() || CompareFileTime(&e.mt, &fd.ftLastWriteTime) != 0) {
-                e = RepEntry{};
-                e.path = g_repDir + L"\\" + fd.cFileName;
-                e.mt = fd.ftLastWriteTime;
+            if (!ParseRepName(fd.cFileName, key, w, hgt, fam) || t->byHash.count(key)) continue;
+            ++st.files;
+            t->sigs.insert(SigKey(w, hgt, fam));
+            const uint64_t size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            const std::wstring path = g_repDir + L"\\" + fd.cFileName;
+            auto it = old.byHash.find(key);
+            if (it != old.byHash.end() && it->second->path == path && it->second->size == size &&
+                CompareFileTime(&it->second->mt, &fd.ftLastWriteTime) == 0) {
+                t->byHash[key] = it->second;
+                continue;
             }
+            auto e = std::make_shared<RepEntry>();
+            e->path = path;
+            e->mt = fd.ftLastWriteTime;
+            e->size = size;
+            t->byHash[key] = e;
+            ++(it == old.byHash.end() ? st.added : st.changed);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    for (auto it = g_rep.begin(); it != g_rep.end();)
-        it = present.count(it->first) ? std::next(it) : g_rep.erase(it);
-    std::lock_guard<std::mutex> lk(g_sigMu);
-    g_sigs.swap(sigs);
+    for (const auto& kv : old.byHash)
+        if (!t->byHash.count(kv.first)) ++st.removed;
+    return t;
 }
 
-RepEntry* FindRep(uint64_t hash) {
-    auto it = g_rep.find(hash);
-    if (it == g_rep.end()) return nullptr;
-    if (!it->second.loaded) LoadRep(it->second);
-    return &it->second;
+uint64_t Preload(const RepTable& t) {
+    std::vector<RepPtr> order;
+    order.reserve(t.byHash.size());
+    for (const auto& kv : t.byHash) order.push_back(kv.second);
+    std::sort(order.begin(), order.end(), [](const RepPtr& a, const RepPtr& b) { return CompareFileTime(&a->mt, &b->mt) > 0; });
+    uint64_t used = 0;
+    for (const RepPtr& e : order) {
+        if (used + e->size > kPreloadBudget) continue;
+        EnsureLoaded(e);
+        used += e->size;
+    }
+    return used;
 }
+
+void RescanReplacements(bool preload, bool log) {
+    ScanStats st;
+    std::shared_ptr<RepTable> t = BuildTable(*CurrentTable(), st);
+    PublishTable(t);
+    const uint64_t pre = preload ? Preload(*t) : 0;
+    if (log && (st.added || st.changed || st.removed))
+        hexon::Log("replacements: %zu file(s) (%zu new, %zu changed, %zu removed), %llu MB preloaded", st.files, st.added,
+                   st.changed, st.removed, (unsigned long long)(pre >> 20));
+}
+
+std::atomic<bool> g_watchStop{false};
+HANDLE g_watchThread = nullptr;
+
+DWORD WINAPI ReplacementWatcher(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    {
+        const std::shared_ptr<const RepTable> t = CurrentTable();
+        const uint64_t pre = Preload(*t);
+        hexon::Log("replacements: %zu file(s), %llu MB preloaded, watching the folder for changes", t->byHash.size(),
+                   (unsigned long long)(pre >> 20));
+    }
+    HANDLE dir = CreateFileW(g_repDir.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    alignas(DWORD) uint8_t buf[16384];
+    while (!g_watchStop) {
+        if (dir != INVALID_HANDLE_VALUE) {
+            DWORD got = 0;
+            if (!ReadDirectoryChangesW(dir, buf, sizeof buf, FALSE,
+                                       FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+                                       &got, nullptr, nullptr)) {
+                const DWORD err = GetLastError();
+                CloseHandle(dir);
+                dir = INVALID_HANDLE_VALUE;
+                if (g_watchStop) break;
+                hexon::Log("replacement watcher can't watch the folder (error %lu), checking every 3 seconds instead", err);
+                continue;
+            }
+        } else {
+            Sleep(3000);
+        }
+        if (g_watchStop) break;
+        Sleep(200);
+        RescanReplacements(true, true);
+    }
+    if (dir != INVALID_HANDLE_VALUE) CloseHandle(dir);
+    return 0;
+}
+
+void StartWatcher() {
+    g_watchStop = false;
+    g_watchThread = CreateThread(nullptr, 0, ReplacementWatcher, nullptr, 0, nullptr);
+}
+
+void StopWatcher() {
+    if (!g_watchThread) return;
+    g_watchStop = true;
+    CancelSynchronousIo(g_watchThread);
+    WaitForSingleObject(g_watchThread, 5000);
+    CloseHandle(g_watchThread);
+    g_watchThread = nullptr;
+}
+
 
 struct Pending {
     ID3D12Resource* src;
@@ -209,8 +335,99 @@ struct Pending {
     DXGI_FORMAT fmt;
     UINT w, h, rowPitch;
     UINT subresource;
-    bool small;
+    bool tiny;
 };
+
+const GUID kGroupGuid = {0x5d1e7a40, 0x2c3b, 0x4e91, {0xa6, 0x0f, 0x7b, 0x18, 0x93, 0xd2, 0x4c, 0x5e}};
+const char kIndexHeader[] = "hash\tw\th\tfamily\tmip\tmips\tslice\ttop_w\ttop_h\tgroup\tsession\ttime_ms\n";
+std::atomic<uint64_t> g_nextGroup{1};
+uint64_t g_session = 1;
+FILE* g_index = nullptr;
+bool g_indexDirty = false;
+std::unordered_set<uint64_t> g_indexed, g_indexChecked;
+
+uint64_t UnixMillis() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    const uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (t - 116444736000000000ull) / 10000;
+}
+
+uint64_t NewSessionId() {
+    LARGE_INTEGER q{};
+    QueryPerformanceCounter(&q);
+    const uint64_t mix[3] = {(uint64_t)q.QuadPart, (uint64_t)GetCurrentProcessId(), UnixMillis()};
+    const uint64_t id = Hash64((const uint8_t*)mix, sizeof mix, 0x51ED270B27FB3A9Dull);
+    return id ? id : 1;
+}
+
+uint64_t GroupId(ID3D12Resource* r) {
+    uint64_t id = 0;
+    UINT sz = sizeof id;
+    if (SUCCEEDED(r->GetPrivateData(kGroupGuid, &sz, &id)) && sz == sizeof id && id) return id;
+    id = g_nextGroup++;
+    r->SetPrivateData(kGroupGuid, sizeof id, &id);
+    return id;
+}
+
+std::string IndexLine(uint64_t hash, UINT w, UINT h, const char* fam, UINT mip, UINT mips, UINT slice, uint64_t topW, UINT topH,
+                      uint64_t group, uint64_t session, uint64_t ms) {
+    char buf[256];
+    snprintf(buf, sizeof buf, "%016llx\t%u\t%u\t%s\t%u\t%u\t%u\t%llu\t%u\t%016llx\t%016llx\t%llu\n", (unsigned long long)hash, w, h,
+             fam, mip, mips, slice, (unsigned long long)topW, topH, (unsigned long long)group, (unsigned long long)session,
+             (unsigned long long)ms);
+    return buf;
+}
+
+size_t LoadIndexedHashes(const std::vector<uint8_t>& buf, std::unordered_set<uint64_t>& out) {
+    size_t pos = 0, n = 0;
+    bool header = true;
+    while (pos < buf.size()) {
+        size_t end = pos;
+        while (end < buf.size() && buf[end] != '\n') ++end;
+        if (!header && end - pos >= 17 && buf[pos + 16] == '\t') {
+            char hex[17];
+            memcpy(hex, &buf[pos], 16);
+            hex[16] = 0;
+            char* stop = nullptr;
+            const uint64_t v = _strtoui64(hex, &stop, 16);
+            if (stop == hex + 16 && out.insert(v).second) ++n;
+        }
+        header = false;
+        pos = end + 1;
+    }
+    return n;
+}
+
+void OpenIndex() {
+    const std::wstring path = g_dumpDir + L"\\index.tsv";
+    std::vector<uint8_t> buf;
+    const bool existed = ReadWholeFile(path, buf);
+    g_indexed.clear();
+    g_indexChecked.clear();
+    if (existed) LoadIndexedHashes(buf, g_indexed);
+    g_index = _wfsopen(path.c_str(), L"ab", _SH_DENYNO);
+    if (!g_index) {
+        hexon::Log("could not open the dump index, mip grouping will be missing for this session");
+        return;
+    }
+    setvbuf(g_index, nullptr, _IOFBF, 1 << 16);
+    if (buf.empty()) fputs(kIndexHeader, g_index);
+    else if (buf.back() != '\n') fputc('\n', g_index);
+    fflush(g_index);
+}
+
+void IndexTexture(uint64_t hash, const Pending& p, const char* fam, bool dumpedNow, const std::wstring& dumpPath) {
+    if (!g_index || g_indexed.count(hash) || !g_indexChecked.insert(hash).second) return;
+    if (!dumpedNow && GetFileAttributesW(dumpPath.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    const D3D12_RESOURCE_DESC d = p.dst->GetDesc();
+    const UINT mips = d.MipLevels ? d.MipLevels : 1;
+    const std::string line = IndexLine(hash, p.w, p.h, fam, p.subresource % mips, mips, p.subresource / mips, d.Width, d.Height,
+                                       GroupId(p.dst), g_session, UnixMillis());
+    fputs(line.c_str(), g_index);
+    g_indexed.insert(hash);
+    g_indexDirty = true;
+}
 
 std::mutex g_pendMu, g_procMu;
 std::unordered_map<void*, std::vector<Pending>> g_pending;
@@ -289,11 +506,11 @@ void STDMETHODCALLTYPE HkCopyTextureRegion(ID3D12GraphicsCommandList* self,
                 hexon::Log("unsupported upload format %u (%ux%u)", (unsigned)fp.Footprint.Format, fp.Footprint.Width, fp.Footprint.Height);
         } else {
 
-            const bool small = fp.Footprint.Width < g_minDim || fp.Footprint.Height < g_minDim;
+            const bool tiny = fp.Footprint.Width < g_minDim || fp.Footprint.Height < g_minDim;
             bool want = true;
-            if (small) {
+            if (tiny) {
                 Mark mk;
-                want = g_replace && (SigKnown(fp.Footprint.Width, fp.Footprint.Height, fi.name) ||
+                want = g_replace && (SigKnown(*CurrentTable(), fp.Footprint.Width, fp.Footprint.Height, fi.name) ||
                                      (g_mips && GetMark(dst->pResource, mk)));
             }
             if (!want) {
@@ -305,7 +522,7 @@ void STDMETHODCALLTYPE HkCopyTextureRegion(ID3D12GraphicsCommandList* self,
                 auto& v = g_pending[(void*)self];
                 if (v.size() < 8192) {
                     v.push_back({src->pResource, dst->pResource, fp.Offset, fp.Footprint.Format, fp.Footprint.Width,
-                                 fp.Footprint.Height, fp.Footprint.RowPitch, dst->SubresourceIndex, small});
+                                 fp.Footprint.Height, fp.Footprint.RowPitch, dst->SubresourceIndex, tiny});
                     ++g_nCopies; ++d_queued;
                 } else {
                     src->pResource->Release();
@@ -376,20 +593,17 @@ bool PatchFromRep(uint8_t* ptr, const Pending& p, const Geometry& g, const RepEn
     return true;
 }
 
-bool ApplyMarked(uint8_t* ptr, const Pending& p, const Geometry& g, const Mark& mk) {
+bool ApplyMarked(const RepTable& t, uint8_t* ptr, const Pending& p, const Geometry& g, const Mark& mk) {
     if (p.subresource < mk.base) return false;
-    auto it = g_rep.find(mk.key);
-    if (it == g_rep.end()) return false;
-    RepEntry& e = it->second;
-    if (!e.loaded) LoadRep(e);
-    if (!e.valid || !PatchFromRep(ptr, p, g, e, p.subresource - mk.base)) return false;
+    RepEntry* e = FindRep(t, mk.key);
+    if (!e || !e->valid || !PatchFromRep(ptr, p, g, *e, p.subresource - mk.base)) return false;
     ++d_mipPatched;
     if (++g_nMip <= 10 || g_nMip % 500 == 0)
         hexon::Log("mip %u patched from %016llx (%ux%u %s, total %llu)", p.subresource - mk.base, (unsigned long long)mk.key, p.w, p.h, g.fi.name, (unsigned long long)g_nMip);
     return true;
 }
 
-void ProcessOne(const Pending& p, size_t idx, std::vector<size_t>& deferred) {
+void ProcessOne(const RepTable& t, const Pending& p, size_t idx, std::vector<size_t>& deferred) {
     Geometry g;
     if (!SurfaceGeometry(p, g)) return;
     uint8_t* ptr = MapStaging(p, g);
@@ -407,7 +621,7 @@ void ProcessOne(const Pending& p, size_t idx, std::vector<size_t>& deferred) {
     if (g_replace) {
         Mark mk{};
         const bool marked = g_mips && GetMark(p.dst, mk);
-        if (RepEntry* e = FindRep(hash)) {
+        if (RepEntry* e = FindRep(t, hash)) {
             if (e->valid && PatchFromRep(ptr, p, g, *e, 0)) {
                 wrote = true;
                 if (++g_nReplaced <= 20 || g_nReplaced % 200 == 0)
@@ -420,22 +634,27 @@ void ProcessOne(const Pending& p, size_t idx, std::vector<size_t>& deferred) {
                 else hexon::Log("replacement for %016llx rejected (needs %ux%u %s, file is %ux%u)", (unsigned long long)hash, p.w, p.h, g.fi.name, e->w, e->h);
             }
         } else if (marked) {
-            wrote = ApplyMarked(ptr, p, g, mk);
+            wrote = ApplyMarked(t, ptr, p, g, mk);
         } else if (g_mips && g_anyMipRep) {
             deferred.push_back(idx);
         }
     }
 
-    if (!p.small) {
+    if (!p.tiny) {
         if (g_dump && g_dumpBytes >= g_maxDumpBytes && !g_capLogged) {
             g_capLogged = true;
             hexon::Log("dump size cap reached (%llu MB), no more dumps", (unsigned long long)(g_dumpBytes >> 20));
         }
-        if (g_dump && g_seen.size() < g_maxDumps && g_dumpBytes < g_maxDumpBytes && g_seen.insert(hash).second) {
+        const bool wantDump = g_dump && g_seen.size() < g_maxDumps && g_dumpBytes < g_maxDumpBytes && g_seen.insert(hash).second;
+        const bool wantIndex = g_index && !g_indexed.count(hash) && !g_indexChecked.count(hash);
+        if (wantDump || wantIndex) {
             const std::wstring path = g_dumpDir + L"\\" + HexName(hash, p.w, p.h, g.fi.name);
-            if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES && WriteDds(path, p.fmt, p.w, p.h, tight)) {
+            bool dumpedNow = false;
+            if (wantDump && GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES && WriteDds(path, p.fmt, p.w, p.h, tight)) {
                 ++g_nDumped; g_dumpBytes += tight.size();
+                dumpedNow = true;
             }
+            if (wantIndex) IndexTexture(hash, p, g.fi.name, dumpedNow, path);
         }
     }
 
@@ -449,8 +668,9 @@ void ProcessOne(const Pending& p, size_t idx, std::vector<size_t>& deferred) {
 }
 
 void ProcessAll(std::vector<Pending>& work) {
+    const std::shared_ptr<const RepTable> table = CurrentTable();
     std::vector<size_t> deferred;
-    for (size_t i = 0; i < work.size(); ++i) ProcessOne(work[i], i, deferred);
+    for (size_t i = 0; i < work.size(); ++i) ProcessOne(*table, work[i], i, deferred);
 
     for (size_t i : deferred) {
         const Pending& p = work[i];
@@ -460,9 +680,13 @@ void ProcessAll(std::vector<Pending>& work) {
         if (!SurfaceGeometry(p, g)) continue;
         uint8_t* ptr = MapStaging(p, g);
         if (!ptr) continue;
-        const bool wrote = ApplyMarked(ptr, p, g, mk);
+        const bool wrote = ApplyMarked(*table, ptr, p, g, mk);
         D3D12_RANGE wr = wrote ? D3D12_RANGE{p.offset, g.need} : D3D12_RANGE{0, 0};
         p.src->Unmap(0, &wr);
+    }
+    if (g_indexDirty) {
+        fflush(g_index);
+        g_indexDirty = false;
     }
 }
 
@@ -484,12 +708,6 @@ void STDMETHODCALLTYPE HkExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandLis
     if (work.empty() && totalLists > 256 && !g_warnedUnmatched) {
         g_warnedUnmatched = true;
         hexon::Log("warning: %zu command lists hold texture uploads but none matched a submit; list pointers may differ", totalLists);
-    }
-
-    const ULONGLONG now = GetTickCount64();
-    if (g_replace && now - g_lastScan.load() > 3000) {
-        std::unique_lock<std::mutex> lk(g_procMu, std::try_to_lock);
-        if (lk.owns_lock()) { g_lastScan = now; ScanReplacements(); }
     }
 
     if (!work.empty()) {
@@ -605,9 +823,13 @@ void Init() {
     g_maxDumpBytes = (uint64_t)GetPrivateProfileIntW(L"hexon", L"max_dump_mb", 4096, ini.c_str()) << 20;
     g_verbose   = GetPrivateProfileIntW(L"hexon", L"verbose", 0, ini.c_str()) != 0;
     g_mips      = GetPrivateProfileIntW(L"hexon", L"mips", 1, ini.c_str()) != 0;
-    if (g_replace) ScanReplacements();
+    if (g_replace) RescanReplacements(false, false);
     g_dumpBytes = ScanDumpSize();
+    g_session = NewSessionId();
+    OpenIndex();
     hexon::Log("---- Hexon %s started (dump=%d replace=%d mips=%d min_dim=%u, dump folder %llu MB of %llu MB cap) ----", g_keepMarker + 16, g_dump, g_replace, g_mips, g_minDim, (unsigned long long)(g_dumpBytes >> 20), (unsigned long long)(g_maxDumpBytes >> 20));
+    hexon::Log("dump index: %zu texture(s) indexed, session %016llx", g_indexed.size(), (unsigned long long)g_session);
+    if (g_replace) StartWatcher();
 
     if (MH_Initialize() != MH_OK) { hexon::Log("MH_Initialize failed"); return; }
     LoadLibraryW(L"d3d12.dll");

@@ -1,8 +1,10 @@
 import json
 import os
 import re
+import shutil
 import struct
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +16,9 @@ MARKER_RE = re.compile(rb"HEXON-PROXY-DLL:([0-9A-Za-z.\-]+)")
 NOT_INSTALLED, CURRENT, OUTDATED, FOREIGN, NO_EXE = "not_installed", "current", "outdated", "foreign", "no_exe"
 
 DEFAULT_SETTINGS = {"dump": True, "replace": True, "mips": True, "verbose": False, "min_dim": 64, "dump_gb": 4.0}
+
+INDEX_NAME = "index.tsv"
+INDEX_INT_FIELDS = ("w", "h", "mip", "mips", "slice", "top_w", "top_h", "time_ms")
 
 ANTICHEAT_FILES = {
     "battleye": "BattlEye", "beservice.exe": "BattlEye", "beservice_x64.exe": "BattlEye",
@@ -189,7 +194,11 @@ def find_marker_version(path):
 
 
 def version_tuple(v):
-    return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.\-]", v or "0"))
+    main, _, pre = (v or "0").partition("-")
+    nums = [int(x) if x.isdigit() else 0 for x in main.split(".")]
+    nums += [0] * (3 - len(nums))
+    tail = [-1] + [int(x) if x.isdigit() else 0 for x in re.split(r"[.\-]", pre)] if pre else [0]
+    return tuple(nums + tail)
 
 
 def dll_state(profile: Profile, core_dll) -> str:
@@ -374,6 +383,55 @@ def last_launch_summary(profile: Profile):
         return "failed", "Last launch: Hexon loaded but couldn't hook DirectX 12 (see Log)."
     return "no_dx12", ("Last launch: Hexon loaded, but the game never created a DirectX 12 device. "
                        "This may be the wrong exe, or not a DirectX 12 game.")
+
+
+def atomic_copy(src, dest, attempts=40, delay=0.05):
+    src, dest = Path(src), Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    shutil.copyfile(src, tmp)
+    for i in range(attempts):
+        try:
+            os.replace(tmp, dest)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            time.sleep(delay)
+
+
+def read_dump_index(path) -> dict:
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    if not lines:
+        return {}
+    cols = lines[0].split("\t")
+    if "hash" not in cols:
+        return {}
+    out = {}
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) != len(cols):
+            continue
+        rec = dict(zip(cols, parts))
+        h = rec["hash"].lower()
+        if len(h) != 16 or any(c not in "0123456789abcdef" for c in h):
+            continue
+        try:
+            for k in INDEX_INT_FIELDS:
+                if k in rec:
+                    rec[k] = int(rec[k])
+        except ValueError:
+            continue
+        rec["hash"] = h
+        out.setdefault(h, rec)
+    return out
 
 
 def remove_all(data_dir=None) -> int:

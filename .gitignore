@@ -7,3 +7,5 @@ prebuilt/
 *.egg-info/
 .vscode/
 .idea/
+.pytest_cache/
+build-tests/
