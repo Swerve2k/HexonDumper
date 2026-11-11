@@ -1,6 +1,5 @@
 # Hexon
 
-![Downloads](https://img.shields.io/github/downloads/Swerve2k/HexonDumper/total?color=black)
 [![Latest release](https://img.shields.io/github/v/release/Swerve2k/HexonDumper?label=download&color=black)](https://github.com/Swerve2k/HexonDumper/releases/latest)
 
 Dump and replace textures in DirectX 12 games on Windows.
